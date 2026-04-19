@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Kinetic Sensory Sandbox — v0.1</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0a0a0f;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    touch-action: none;
+  }
+  canvas {
+    display: block;
+    position: fixed;
+    inset: 0;
+  }
+  #overlay {
+    position: fixed;
+    top: 24px;
+    left: 24px;
+    color: rgba(255,255,255,0.55);
+    pointer-events: none;
+    mix-blend-mode: difference;
+    z-index: 10;
+  }
+  #overlay h1 {
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+    color: rgba(255,255,255,0.85);
+  }
+  #overlay p {
+    font-size: 11px;
+    letter-spacing: 0.05em;
+    line-height: 1.6;
+    max-width: 300px;
+  }
+  #fps {
+    position: fixed;
+    top: 24px;
+    right: 24px;
+    color: rgba(255,255,255,0.35);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    z-index: 10;
+    pointer-events: none;
+  }
+  #unlock {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10,10,15,0.96);
+    color: rgba(255,255,255,0.85);
+    cursor: pointer;
+    z-index: 100;
+    transition: opacity 0.5s ease;
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    user-select: none;
+  }
+  #unlock.hidden { opacity: 0; pointer-events: none; }
+  #unlock span {
+    padding: 18px 36px;
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 999px;
+    transition: all 0.3s;
+  }
+  #unlock:hover span {
+    border-color: rgba(255,255,255,0.5);
+    transform: scale(1.02);
+  }
+</style>
+</head>
+<body>
+  <canvas id="bg"></canvas>
+  <canvas id="fg"></canvas>
+
+  <div id="overlay">
+    <h1>Kinetic Sensory Sandbox</h1>
+    <p>Drag the orbs. Slow motion hums; fast motion rings. Every gesture is heard.</p>
+  </div>
+  <div id="fps">— fps</div>
+
+  <div id="unlock"><span>Tap to begin</span></div>
+
+<script>
+'use strict';
+
+// =============================================================
+//  AUDIO ENGINE — procedural, three layers:
+//    1. Transient click (sine body + filtered noise burst)
+//    2. Continuous drag friction (filtered pink noise)
+//    3. Release bloom (inharmonic bell)
+// =============================================================
+class AudioEngine {
+  constructor() {
+    this.ctx = null;
+    this.mixerIn = null;
+    this.master = null;
+    this.humOscA = null;
+    this.humOscB = null;
+    this.humGain = null;
+    this.ringOsc = null;
+    this.ringFilter = null;
+    this.ringGain = null;
+    this.bloomBus = null;
+    this.bloomShaper = null;
+    this.noiseBuffer = null;
+    this.unlocked = false;
+  }
+
+  // Soft-clip curve for the bloom bus — gives "sleazy dirty EP" harmonic character.
+  // Generates ~3rd-order harmonic distortion that's warm, not harsh.
+  _makeDirtCurve(amount = 0.35) {
+    const samples = 1024;
+    const curve = new Float32Array(samples);
+    const k = amount * 40;
+    const deg = Math.PI / 180;
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / samples - 1;
+      curve[i] = ((3 + k) * x * 20 * deg) / (Math.PI + k * Math.abs(x));
+    }
+    return curve;
+  }
+
+  async unlock() {
+    if (this.unlocked) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC({ latencyHint: 'interactive' });
+    await this.ctx.resume();
+
+    // --- Master chain: compressor -> warm LPF -> master gain -> out
+    const comp = this.ctx.createDynamicsCompressor();
+    comp.threshold.value = -20;
+    comp.knee.value = 18;
+    comp.ratio.value = 4;
+    comp.attack.value = 0.003;
+    comp.release.value = 0.25;
+
+    const warmth = this.ctx.createBiquadFilter();
+    warmth.type = 'lowpass';
+    warmth.frequency.value = 9000;
+    warmth.Q.value = 0.4;
+
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.85;
+
+    comp.connect(warmth).connect(this.master).connect(this.ctx.destination);
+    this.mixerIn = comp;
+
+    // --- Bloom bus: soft-clip waveshaper ONLY on the bloom voice. Gives the EP
+    // "sleazy bite" without distorting clicks or hum. High-shelf cut after the
+    // shaper tames the post-clipping fizz so it reads as warmth, not harshness.
+    this.bloomBus = this.ctx.createGain();
+    this.bloomBus.gain.value = 1.25;      // compensate for shaper amplitude loss
+
+    this.bloomShaper = this.ctx.createWaveShaper();
+    this.bloomShaper.curve = this._makeDirtCurve(0.38);
+    this.bloomShaper.oversample = '2x';   // reduce aliasing from the nonlinearity
+
+    const bloomEQ = this.ctx.createBiquadFilter();
+    bloomEQ.type = 'highshelf';
+    bloomEQ.frequency.value = 3500;
+    bloomEQ.gain.value = -2.5;
+
+    this.bloomBus.connect(this.bloomShaper).connect(bloomEQ).connect(this.mixerIn);
+
+    // --- Pre-generate pink noise (Paul Kellet refined) for all noise uses
+    const len = this.ctx.sampleRate * 2;
+    this.noiseBuffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const data = this.noiseBuffer.getChannelData(0);
+    let b0=0, b1=0, b2=0, b3=0, b4=0, b5=0, b6=0;
+    for (let i = 0; i < len; i++) {
+      const w = Math.random() * 2 - 1;
+      b0 = 0.99886 * b0 + w * 0.0555179;
+      b1 = 0.99332 * b1 + w * 0.0750759;
+      b2 = 0.96900 * b2 + w * 0.1538520;
+      b3 = 0.86650 * b3 + w * 0.3104856;
+      b4 = 0.55000 * b4 + w * 0.5329522;
+      b5 = -0.7616 * b5 - w * 0.0168980;
+      data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11;
+      b6 = w * 0.115926;
+    }
+
+    // --- Persistent drag voice — two layers:
+    //   HUM : two detuned sines, linear in speed → breathing body tone
+    //   RING: sawtooth through resonant BPF, quadratic in speed → shimmers in on flicks
+    this.humOscA = this.ctx.createOscillator();
+    this.humOscA.type = 'sine';
+    this.humOscA.frequency.value = 130;
+
+    this.humOscB = this.ctx.createOscillator();
+    this.humOscB.type = 'sine';
+    this.humOscB.frequency.value = 131.5;   // ~1.5Hz detune = perceptible chorus beat
+
+    this.humGain = this.ctx.createGain();
+    this.humGain.gain.value = 0;
+
+    this.humOscA.connect(this.humGain);
+    this.humOscB.connect(this.humGain);
+    this.humGain.connect(this.mixerIn);
+
+    this.ringOsc = this.ctx.createOscillator();
+    this.ringOsc.type = 'sawtooth';
+    this.ringOsc.frequency.value = 390;    // 3× hum fundamental
+
+    this.ringFilter = this.ctx.createBiquadFilter();
+    this.ringFilter.type = 'bandpass';
+    this.ringFilter.frequency.value = 400;
+    this.ringFilter.Q.value = 7;           // resonant but not self-oscillating
+
+    this.ringGain = this.ctx.createGain();
+    this.ringGain.gain.value = 0;
+
+    this.ringOsc.connect(this.ringFilter).connect(this.ringGain).connect(this.mixerIn);
+
+    this.humOscA.start();
+    this.humOscB.start();
+    this.ringOsc.start();
+
+    this.unlocked = true;
+  }
+
+  // Fired on pointerdown over an orb
+  playClick(pitch = 1, vol = 1) {
+    if (!this.unlocked) return;
+    const t = this.ctx.currentTime;
+    const freq = 90 * pitch;
+
+    // Body: pitch-dropping sine thud
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq * 2.2, t);
+    osc.frequency.exponentialRampToValueAtTime(freq, t + 0.09);
+    const og = this.ctx.createGain();
+    og.gain.setValueAtTime(0, t);
+    og.gain.linearRampToValueAtTime(0.38 * vol, t + 0.004);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.32);
+    osc.connect(og).connect(this.mixerIn);
+    osc.start(t);
+    osc.stop(t + 0.35);
+
+    // Transient: short bandpassed noise — the "tactile" click
+    const ns = this.ctx.createBufferSource();
+    ns.buffer = this.noiseBuffer;
+    ns.playbackRate.value = 1 + Math.random() * 0.2;
+    const nf = this.ctx.createBiquadFilter();
+    nf.type = 'bandpass';
+    nf.frequency.value = 1800 + Math.random() * 1800;
+    nf.Q.value = 3.5;
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.18 * vol, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.045);
+    ns.connect(nf).connect(ng).connect(this.mixerIn);
+    ns.start(t);
+    ns.stop(t + 0.07);
+  }
+
+  // Fired on pointerup — EP bloom (Rhodes-ish harmonic stack through soft-clip for sleaze)
+  playBloom(pitch = 1, vol = 1) {
+    if (!this.unlocked) return;
+    const t = this.ctx.currentTime;
+    const base = 230 * pitch;
+
+    // Harmonic partials (not inharmonic like a bell). Triangle on fundamental gives reed-bite;
+    // sines on upper partials keep the top end from getting harsh through the shaper.
+    const parts = [
+      { ratio: 1.0, type: 'sine', amp: 0.34, dur: 1.6  },  // body with slight bite
+      { ratio: 2.0, type: 'sine',     amp: 0.18, dur: 1.0  },  // octave — brightness
+      { ratio: 3.0, type: 'sine',     amp: 0.09, dur: 0.55 },  // octave+5th — pluck
+      { ratio: 4.0, type: 'sine',     amp: 0.05, dur: 0.38 },  // 2 octaves — tine shimmer
+    ];
+
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      const o = this.ctx.createOscillator();
+      o.type = p.type;
+      o.frequency.value = base * p.ratio;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(p.amp * vol, t + 0.004);    // 4ms attack — EP-fast
+      g.gain.exponentialRampToValueAtTime(0.0005, t + p.dur);
+      o.connect(g).connect(this.bloomBus);                        // through the dirt bus
+      o.start(t);
+      o.stop(t + p.dur + 0.05);
+    }
+
+    // Tine strike: bright bandpassed noise at attack — the "hammer hits reed" transient
+    const tine = this.ctx.createBufferSource();
+    tine.buffer = this.noiseBuffer;
+    const tineFilt = this.ctx.createBiquadFilter();
+    tineFilt.type = 'bandpass';
+    tineFilt.frequency.value = 2400 + Math.random() * 900;
+    tineFilt.Q.value = 4.5;
+    const tineGain = this.ctx.createGain();
+    tineGain.gain.setValueAtTime(0.04 * vol, t);
+    tineGain.gain.exponentialRampToValueAtTime(0.0005, t + 0.03);
+    tine.connect(tineFilt).connect(tineGain).connect(this.bloomBus);
+    tine.start(t);
+    tine.stop(t + 0.05);
+  }
+
+  // Continuous — called every frame during drag with current speed (px/frame).
+  // Uses setTargetAtTime (exponential approach) instead of cancel+linearRamp so
+  // rapid updates don't create slope discontinuities (zipper noise / low-grade crackle).
+  setDragIntensity(speed) {
+    if (!this.unlocked) return;
+    const t  = this.ctx.currentTime;
+    const tc = 0.05;                              // smoothing time constant (~1/e in 50ms)
+    const n  = Math.min(speed / 18, 1);           // normalised 0..1
+
+    // HUM: linear in speed — present from first motion. Pure sines, no harmonics, no crackle risk.
+    const humTarget = n * 0.11;
+    const humFreqA  = 130 + n * 45;               // subtle pitch rise with velocity
+    const humFreqB  = humFreqA + 1.5;
+
+    this.humGain.gain.setTargetAtTime(humTarget, t, tc);
+    this.humOscA.frequency.setTargetAtTime(humFreqA, t, tc);
+    this.humOscB.frequency.setTargetAtTime(humFreqB, t, tc);
+
+    // RING: hard-gated below threshold, then cubic above. Gate is critical — a sawtooth
+    // through a high-Q bandpass at microscopic gain still produces audible edge transients
+    // because the filter rings on each cycle boundary. Below the gate, ring is TRULY zero.
+    const THRESH = 0.22;
+    const ringN = n < THRESH ? 0 : (n - THRESH) / (1 - THRESH);
+    const ringTarget = ringN * ringN * ringN * 0.10;
+    const ringCutoff = 300 + n * 2400;
+    const ringFreq   = humFreqA * 3;              // track 3rd harmonic of hum
+
+    this.ringGain.gain.setTargetAtTime(ringTarget, t, tc);
+    this.ringFilter.frequency.setTargetAtTime(ringCutoff, t, tc);
+    this.ringOsc.frequency.setTargetAtTime(ringFreq, t, tc);
+  }
+
+  stopDrag() {
+    if (!this.unlocked) return;
+    const t  = this.ctx.currentTime;
+    const tc = 0.04;                              // exponential release — ~inaudible after ~200ms
+    this.humGain.gain.setTargetAtTime(0, t, tc);
+    this.ringGain.gain.setTargetAtTime(0, t, tc);
+  }
+}
+
+// =============================================================
+//  PARTICLE POOL — zero-allocation in hot loop
+// =============================================================
+class ParticlePool {
+  constructor(size = 800) {
+    this.pool = new Array(size);
+    for (let i = 0; i < size; i++) {
+      this.pool[i] = { x:0, y:0, vx:0, vy:0, life:0, maxLife:1, hue:0, size:0, active:false };
+    }
+    this.active = [];
+  }
+
+  emit(x, y, vx, vy, hue) {
+    let p = null;
+    for (let i = 0; i < this.pool.length; i++) {
+      if (!this.pool[i].active) { p = this.pool[i]; break; }
+    }
+    if (!p) return;
+    const speed = Math.hypot(vx, vy);
+    // Eject opposite to motion with spread
+    const angle = Math.atan2(vy, vx) + Math.PI + (Math.random() - 0.5) * 0.7;
+    const mag   = speed * 0.32 + Math.random() * 1.8;
+    p.x = x;
+    p.y = y;
+    p.vx = Math.cos(angle) * mag + (Math.random() - 0.5) * 0.8;
+    p.vy = Math.sin(angle) * mag + (Math.random() - 0.5) * 0.8;
+    p.maxLife = 45 + Math.random() * 40;
+    p.life = p.maxLife;
+    p.hue = hue + (Math.random() - 0.5) * 25;
+    p.size = 1.4 + Math.random() * 3 + speed * 0.08;
+    p.active = true;
+    this.active.push(p);
+  }
+
+  update() {
+    for (let i = this.active.length - 1; i >= 0; i--) {
+      const p = this.active[i];
+      p.x  += p.vx;
+      p.y  += p.vy;
+      p.vx *= 0.96;
+      p.vy *= 0.96;
+      p.vy += 0.035; // soft gravity
+      p.life--;
+      if (p.life <= 0) {
+        p.active = false;
+        this.active[i] = this.active[this.active.length - 1];
+        this.active.pop();
+      }
+    }
+  }
+
+  draw(ctx) {
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < this.active.length; i++) {
+      const p = this.active[i];
+      const a = p.life / p.maxLife;
+      ctx.fillStyle = `hsla(${p.hue}, 85%, 65%, ${a * 0.9})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+// =============================================================
+//  ORB — spring-anchored, squash/stretch, bloom-on-release
+// =============================================================
+class Orb {
+  constructor(x, y, hue, radius, pitch) {
+    this.x = x; this.y = y;
+    this.vx = 0; this.vy = 0;
+    this.anchorX = x; this.anchorY = y;
+    this.hue = hue;
+    this.radius = radius;
+    this.baseRadius = radius;
+    this.pitch = pitch;         // scale-degree ratio from root (see orbPitches)
+    this.dragging = false;
+    this.k = 0.08;          // spring stiffness
+    this.d = 0.82;          // velocity damping
+    this.squash = 1;        // click/bloom scalar (1 = rest)
+    this.glow = 0;          // 0..1 after release
+    this.ripple = 0;        // 0..1 expanding ring
+  }
+
+  update(others) {
+    if (!this.dragging) {
+      // Anchor spring
+      this.vx = (this.vx + (this.anchorX - this.x) * this.k) * this.d;
+      this.vy = (this.vy + (this.anchorY - this.y) * this.k) * this.d;
+
+      // Soft mutual repulsion — orbs jostle when close
+      for (let i = 0; i < others.length; i++) {
+        const o = others[i];
+        if (o === this) continue;
+        const dx = this.x - o.x;
+        const dy = this.y - o.y;
+        const dist = Math.hypot(dx, dy);
+        const minDist = this.radius + o.radius + 18;
+        if (dist < minDist && dist > 0.01) {
+          const push = (minDist - dist) * 0.09;
+          this.vx += (dx / dist) * push;
+          this.vy += (dy / dist) * push;
+        }
+      }
+
+      this.x += this.vx;
+      this.y += this.vy;
+    }
+
+    // Decay transient states
+    this.squash += (1 - this.squash) * 0.22;
+    this.glow   *= 0.92;
+    this.ripple *= 0.95;
+  }
+
+  get speed() { return Math.hypot(this.vx, this.vy); }
+
+  draw(ctx) {
+    const speed   = this.speed;
+    const stretch = 1 + Math.min(speed * 0.025, 0.5);
+    const sx = stretch * this.squash;
+    const sy = (1 / stretch) * this.squash;
+    const angle = Math.atan2(this.vy, this.vx);
+
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(angle);
+    ctx.scale(sx, sy);
+
+    // Velocity-reactive glow halo — softer saturation for pastel bioluminescence on dark bg
+    const glowR = this.radius * (2 + speed * 0.08 + this.glow * 2);
+    const halo = ctx.createRadialGradient(0, 0, this.radius * 0.4, 0, 0, glowR);
+    halo.addColorStop(0, `hsla(${this.hue}, 65%, 78%, ${0.50 + this.glow * 0.45})`);
+    halo.addColorStop(1, `hsla(${this.hue}, 65%, 78%, 0)`);
+    ctx.fillStyle = halo;
+    ctx.beginPath();
+    ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Body — pastel gradient, keeps luminosity against dark bg (no dark edge stop)
+    const body = ctx.createRadialGradient(
+      -this.radius * 0.35, -this.radius * 0.35, 0,
+      0, 0, this.radius
+    );
+    body.addColorStop(0,   `hsl(${this.hue}, 55%, 93%)`);
+    body.addColorStop(0.5, `hsl(${this.hue}, 50%, 76%)`);
+    body.addColorStop(1,   `hsl(${this.hue}, 45%, 58%)`);
+    ctx.fillStyle = body;
+    ctx.beginPath();
+    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Specular highlight — intensifies with glow
+    ctx.fillStyle = `rgba(255,255,255,${0.42 + this.glow * 0.35})`;
+    ctx.beginPath();
+    ctx.arc(-this.radius * 0.35, -this.radius * 0.35, this.radius * 0.24, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+
+    // Ripple drawn in world space (un-squashed)
+    if (this.ripple > 0.01) {
+      ctx.strokeStyle = `hsla(${this.hue}, 85%, 72%, ${this.ripple})`;
+      ctx.lineWidth = 2.2 * this.ripple;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.radius * (1 + (1 - this.ripple) * 3.2), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  hit(px, py) {
+    return Math.hypot(px - this.x, py - this.y) < this.radius + 4;
+  }
+}
+
+// =============================================================
+//  FLOW FIELD — ambient procedural bg, implicitly disturbed by cursor
+// =============================================================
+class FlowField {
+  constructor() {
+    this.particles = [];
+    this.t = 0;
+  }
+
+  init(w, h) {
+    this.particles = [];
+    const count = 90;
+    for (let i = 0; i < count; i++) {
+      this.particles.push({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        px: 0, py: 0,
+        hue: 200 + Math.random() * 100
+      });
+    }
+  }
+
+  noise(x, y, t) {
+    // Trig-noise — cheap, directionally coherent, looks like flow
+    return Math.sin(x * 0.0032 + t) * Math.cos(y * 0.0028 - t * 0.7)
+         + Math.sin(x * 0.0068 - y * 0.0051 + t * 1.3) * 0.5;
+  }
+
+  update(w, h, mx, my, mouseActive) {
+    this.t += 0.0035;
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      p.px = p.x;
+      p.py = p.y;
+      const n = this.noise(p.x, p.y, this.t);
+      const ang = n * Math.PI * 2;
+      p.x += Math.cos(ang) * 0.65;
+      p.y += Math.sin(ang) * 0.65;
+
+      // Implicit interaction — cursor pushes ambient particles outward
+      if (mouseActive) {
+        const dx = p.x - mx;
+        const dy = p.y - my;
+        const d = Math.hypot(dx, dy);
+        if (d < 220 && d > 0.1) {
+          const push = (220 - d) * 0.011;
+          p.x += (dx / d) * push;
+          p.y += (dy / d) * push;
+        }
+      }
+
+      // Respawn on edge exit
+      if (p.x < -5 || p.x > w + 5 || p.y < -5 || p.y > h + 5) {
+        p.x = Math.random() * w;
+        p.y = Math.random() * h;
+        p.px = p.x; p.py = p.y;
+      }
+    }
+  }
+
+  draw(ctx) {
+    ctx.lineWidth = 1;
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      ctx.strokeStyle = `hsla(${p.hue}, 60%, 58%, 0.28)`;
+      ctx.beginPath();
+      ctx.moveTo(p.px, p.py);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    }
+  }
+}
+
+// =============================================================
+//  MAIN
+// =============================================================
+const bgCanvas = document.getElementById('bg');
+const fgCanvas = document.getElementById('fg');
+const bgCtx = bgCanvas.getContext('2d');
+const fgCtx = fgCanvas.getContext('2d');
+const unlockEl = document.getElementById('unlock');
+const fpsEl = document.getElementById('fps');
+
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+let W = 0, H = 0;
+
+const audio     = new AudioEngine();
+const particles = new ParticlePool(900);
+const flow      = new FlowField();
+
+// 6/9 voicing (C E G A D') — the Michel Legrand / cocktail-jazz chord. Sophisticated, aspirational,
+// structurally consonant (no minor 2nds or tritones). Orb colours paired low→high, cool→warm.
+const orbHues    = [280, 210, 150,  50,  15];                 // lavender, powder blue, mint, butter, peach
+const orbPitches = [1.000, 1.260, 1.498, 1.682, 2.245];        // C, E, G, A, D' (octave + 9th)
+const orbs = orbHues.map((h, i) => new Orb(0, 0, h, 40, orbPitches[i]));
+
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  for (const c of [bgCanvas, fgCanvas]) {
+    c.width  = Math.floor(W * DPR);
+    c.height = Math.floor(H * DPR);
+    c.style.width  = W + 'px';
+    c.style.height = H + 'px';
+  }
+  bgCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  fgCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  flow.init(W, H);
+  positionOrbs();
+}
+
+function positionOrbs() {
+  const spacing = Math.min(W, H) * 0.15;
+  const cx = W / 2, cy = H / 2;
+  const firstRun = orbs.every(o => o.x === 0 && o.y === 0);
+  orbs.forEach((o, i) => {
+    const t = i - (orbs.length - 1) / 2;
+    o.anchorX = cx + t * spacing;
+    o.anchorY = cy;
+    if (firstRun) {
+      o.x = o.anchorX;
+      o.y = o.anchorY;
+    }
+  });
+}
+
+// --- Input state
+const mouse = {
+  x: 0, y: 0, px: 0, py: 0, vx: 0, vy: 0,
+  down: false, active: false
+};
+let dragged = null;
+let dragOffX = 0, dragOffY = 0;
+let lastPointerTime = performance.now();
+
+function onPointerDown(e) {
+  e.preventDefault();
+  const r = fgCanvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+  mouse.down = true;
+  mouse.active = true;
+
+  // Top-most first (orbs at end of array render on top)
+  for (let i = orbs.length - 1; i >= 0; i--) {
+    if (orbs[i].hit(mouse.x, mouse.y)) {
+      dragged = orbs[i];
+      // bring to front
+      orbs.splice(i, 1);
+      orbs.push(dragged);
+      dragged.dragging = true;
+      dragged.squash = 0.72;          // initial click-squash
+      dragOffX = dragged.x - mouse.x;
+      dragOffY = dragged.y - mouse.y;
+      // Each orb is tuned to a pentatonic degree — its pitch is deterministic, not derived from colour
+      audio.playClick(dragged.pitch, 1);
+      break;
+    }
+  }
+  try { fgCanvas.setPointerCapture(e.pointerId); } catch(_) {}
+}
+
+function onPointerMove(e) {
+  const r = fgCanvas.getBoundingClientRect();
+  const now = performance.now();
+  lastPointerTime = now;
+
+  mouse.px = mouse.x;
+  mouse.py = mouse.y;
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+  mouse.active = true;
+
+  // Exponential smoothing — stable pitch, still snappy
+  const instVx = mouse.x - mouse.px;
+  const instVy = mouse.y - mouse.py;
+  mouse.vx = mouse.vx * 0.55 + instVx * 0.45;
+  mouse.vy = mouse.vy * 0.55 + instVy * 0.45;
+}
+
+function onPointerUp(e) {
+  mouse.down = false;
+  if (dragged) {
+    dragged.dragging = false;
+    // Carry mouse velocity into orb → flick
+    dragged.vx = mouse.vx;
+    dragged.vy = mouse.vy;
+    dragged.glow = 1;
+    dragged.ripple = 1;
+    dragged.squash = 1.38;           // bloom outward
+    const speed = Math.hypot(mouse.vx, mouse.vy);
+    // Bloom pitch is locked to the orb's pentatonic tuning; velocity only affects volume/brightness
+    audio.playBloom(dragged.pitch, Math.min(0.35 + speed * 0.035, 1));
+    dragged = null;
+  }
+  audio.stopDrag();
+  try { fgCanvas.releasePointerCapture(e.pointerId); } catch(_) {}
+}
+
+fgCanvas.addEventListener('pointerdown', onPointerDown);
+window.addEventListener('pointermove', onPointerMove);
+window.addEventListener('pointerup', onPointerUp);
+window.addEventListener('pointercancel', onPointerUp);
+fgCanvas.addEventListener('pointerenter', () => mouse.active = true);
+fgCanvas.addEventListener('pointerleave', () => { if (!dragged) mouse.active = false; });
+
+// --- Audio unlock (required by browser autoplay policy)
+async function doUnlock() {
+  await audio.unlock();
+  unlockEl.classList.add('hidden');
+  setTimeout(() => unlockEl && unlockEl.remove(), 600);
+}
+unlockEl.addEventListener('pointerdown', doUnlock, { once: true });
+
+window.addEventListener('resize', resize);
+resize();
+
+// --- Main loop
+let lastFrame = performance.now();
+let fpsAccum = 0, fpsCount = 0, fpsDisplay = 0;
+
+function frame(now) {
+  const dt = Math.min(now - lastFrame, 50);
+  lastFrame = now;
+
+  // FPS meter (averaged every ~500ms)
+  fpsAccum += 1000 / dt;
+  fpsCount++;
+  if (fpsCount >= 30) {
+    fpsDisplay = (fpsAccum / fpsCount) | 0;
+    fpsAccum = 0;
+    fpsCount = 0;
+    fpsEl.textContent = fpsDisplay + ' fps';
+  }
+
+  // --- BACKGROUND (persistent with alpha-fade trails)
+  bgCtx.fillStyle = 'rgba(10, 10, 15, 0.08)';
+  bgCtx.fillRect(0, 0, W, H);
+  flow.update(W, H, mouse.x, mouse.y, mouse.active);
+  flow.draw(bgCtx);
+
+  // --- FOREGROUND (fully cleared each frame)
+  fgCtx.clearRect(0, 0, W, H);
+
+  // Drive the dragged orb via spring-follow (not snap — feels weightier)
+  if (dragged) {
+    const tx = mouse.x + dragOffX;
+    const ty = mouse.y + dragOffY;
+    dragged.vx = (tx - dragged.x) * 0.5;
+    dragged.vy = (ty - dragged.y) * 0.5;
+    dragged.x += dragged.vx;
+    dragged.y += dragged.vy;
+
+    const speed = Math.hypot(dragged.vx, dragged.vy);
+
+    // Particle emission scales with speed — capped per frame
+    const emit = Math.min((speed * 0.55) | 0, 9);
+    for (let i = 0; i < emit; i++) {
+      particles.emit(dragged.x, dragged.y, dragged.vx, dragged.vy, dragged.hue);
+    }
+
+    audio.setDragIntensity(speed);
+  } else {
+    audio.setDragIntensity(0);
+  }
+
+  // Integrate all orbs
+  for (let i = 0; i < orbs.length; i++) orbs[i].update(orbs);
+
+  // Particles under orbs so orbs stay crisp
+  particles.update();
+  particles.draw(fgCtx);
+
+  // Orbs on top
+  for (let i = 0; i < orbs.length; i++) orbs[i].draw(fgCtx);
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
